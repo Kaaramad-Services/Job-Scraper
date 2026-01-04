@@ -2,16 +2,13 @@ services:
   - type: web
     name: job-tracker
     env: python
-    buildCommand: |
-      apt-get update && apt-get install -y wget
-      wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-      echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
-      apt-get update && apt-get install -y google-chrome-stable
-      pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: CHECK_INTERVAL
-        value: 600
+        value: 1800  # 30 minutes
+      - key: PORT
+        value: 10000
     healthCheckPath: /health
