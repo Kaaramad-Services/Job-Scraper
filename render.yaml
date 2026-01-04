@@ -6,10 +6,7 @@ services:
     startCommand: python main.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9  # Changed from 3.11.0 to 3.11.9
       - key: CHECK_INTERVAL
-        value: 600
-    disk:
-      name: job-data
-      mountPath: /data
-      sizeGB: 1
+        value: 840
+    healthCheckPath: /health
