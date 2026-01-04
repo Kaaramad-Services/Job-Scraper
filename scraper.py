@@ -35,58 +35,82 @@ class ExpatriatesScraper:
                 return None
     
     def parse_job_listings(self, html):
-        """Parse job listings from HTML"""
-        soup = BeautifulSoup(html, 'html.parser')
+        """Parse job listings from HTML - using html.parser instead of lxml"""
+        soup = BeautifulSoup(html, 'html.parser')  # Changed from 'lxml' to 'html.parser'
         jobs = []
         
-        # Find job listings - adjust selectors based on actual website structure
-        listings = soup.find_all('div', class_='listing') or soup.find_all('tr', class_='listing')
+        # Find all job listings - try different selectors
+        # First try: look for listing items
+        listings = []
+        
+        # Try multiple possible selectors
+        possible_selectors = [
+            'div.listing',
+            'tr.listing',
+            '.listing-row',
+            '.classified-item',
+            '.ad-item',
+            'div[class*="listing"]',
+            'tr[class*="listing"]'
+        ]
+        
+        for selector in possible_selectors:
+            found = soup.select(selector)
+            if found:
+                listings = found
+                logger.info(f"Found {len(listings)} listings with selector: {selector}")
+                break
+        
+        # If no specific selectors found, try to find any job-like containers
+        if not listings:
+            # Look for common patterns
+            all_links = soup.find_all('a')
+            for link in all_links:
+                if '/classifieds/' in link.get('href', '') and 'saudi-arabia' in link.get('href', ''):
+                    parent = link.parent
+                    if parent not in listings:
+                        listings.append(parent)
+            
+            logger.info(f"Found {len(listings)} listings via link search")
         
         for listing in listings[:50]:  # Limit to 50 listings
             try:
                 job = {}
                 
                 # Extract title and URL
-                title_elem = listing.find('a', class_='title') or listing.find('a')
+                title_elem = listing.find('a')
                 if title_elem:
                     job['title'] = title_elem.text.strip()
-                    job['url'] = urljoin(self.base_url, title_elem.get('href', ''))
+                    href = title_elem.get('href', '')
+                    if href and not href.startswith('http'):
+                        job['url'] = urljoin(self.base_url, href)
+                    else:
+                        job['url'] = href
                 else:
                     continue  # Skip if no title
                 
                 # Extract description/preview
-                desc_elem = listing.find('div', class_='description') or listing.find('td', class_='description')
-                if desc_elem:
-                    job['description'] = desc_elem.text.strip()
-                else:
-                    job['description'] = ""
+                desc_text = listing.get_text()
+                # Remove title from description
+                if 'title' in job:
+                    desc_text = desc_text.replace(job['title'], '')
+                job['description'] = desc_text.strip()[:500]  # Limit to 500 chars
                 
-                # Extract date
-                date_elem = listing.find('span', class_='date') or listing.find('td', class_='date')
-                if date_elem:
-                    job['date_posted'] = date_elem.text.strip()
-                else:
-                    job['date_posted'] = "Recently"
+                # Try to find date
+                date_patterns = ['Posted', 'Date:', 'Added']
+                job['date_posted'] = "Recently"
+                for pattern in date_patterns:
+                    if pattern in desc_text:
+                        # Extract date-like text after pattern
+                        idx = desc_text.find(pattern)
+                        if idx != -1:
+                            date_text = desc_text[idx:idx+50]
+                            job['date_posted'] = date_text.strip()
+                            break
                 
-                # Extract category/type
-                cat_elem = listing.find('span', class_='category') or listing.find('td', class_='category')
-                if cat_elem:
-                    job['category'] = cat_elem.text.strip()
-                else:
-                    job['category'] = "General"
-                
-                # Extract location
-                loc_elem = listing.find('span', class_='location') or listing.find('td', class_='location')
-                if loc_elem:
-                    job['location'] = loc_elem.text.strip()
-                else:
-                    job['location'] = "Saudi Arabia"
-                
-                # Get full description from individual page
-                if job['url']:
-                    job['full_description'] = self.get_full_description_sync(job['url'])
-                else:
-                    job['full_description'] = job['description']
+                job['category'] = "General"
+                job['location'] = "Saudi Arabia"
+                job['full_description'] = job['description']
                 
                 jobs.append(job)
                 
@@ -96,44 +120,28 @@ class ExpatriatesScraper:
         
         return jobs
     
-    def get_full_description_sync(self, url):
-        """Get full description from job page (simplified - you might need async version)"""
-        # For simplicity, using requests in sync mode
-        # In production, make this async too
-        import requests
-        try:
-            response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                desc_div = soup.find('div', class_='description') or soup.find('div', id='description')
-                if desc_div:
-                    return desc_div.text.strip()
-        except:
-            pass
-        return ""
-    
     def extract_contacts(self, text):
         """Extract email and phone numbers from text"""
         contacts = {'email': 'Not found', 'whatsapp': 'Not found'}
         
         # Extract email
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
+        emails = re.findall(email_pattern, text, re.IGNORECASE)
         if emails:
             contacts['email'] = emails[0]  # Take first email
         
         # Extract phone numbers (including WhatsApp)
-        phone_pattern = r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+        phone_pattern = r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
         phones = re.findall(phone_pattern, text)
         
         # Look for WhatsApp specifically
-        whatsapp_pattern = r'(?:whatsapp|wa\.?)\s*[:]?\s*(\+?\d[\d\s\-\(\)]{8,}\d)'
+        whatsapp_pattern = r'(?:whatsapp|wa\.?)[:\s]*(\+?\d[\d\s\-\(\)]{8,}\d)'
         whatsapp_match = re.search(whatsapp_pattern, text.lower())
         
         if whatsapp_match:
-            contacts['whatsapp'] = whatsapp_match.group(1)
+            contacts['whatsapp'] = whatsapp_match.group(1).strip()
         elif phones:
-            contacts['whatsapp'] = phones[0]  # Take first phone as potential WhatsApp
+            contacts['whatsapp'] = phones[0].strip()
         
         return contacts
     
