@@ -1,14 +1,17 @@
 """
-Web scraper for expatriates.com
+Web scraper for expatriates.com with anti-blocking measures
 """
 
 import aiohttp
 import asyncio
+import random
+import time
 from bs4 import BeautifulSoup
 import re
 import logging
 from urllib.parse import urljoin
 from datetime import datetime
+import cloudscraper  # ADD THIS IMPORT - handles Cloudflare
 
 logger = logging.getLogger(__name__)
 
@@ -16,106 +19,208 @@ class ExpatriatesScraper:
     def __init__(self):
         self.base_url = "https://www.expatriates.com"
         self.saudi_url = "https://www.expatriates.com/classifieds/saudi-arabia/"
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        
+        # More realistic headers to avoid detection
+        self.headers_list = [
+            {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+            },
+            {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.google.com/',
+            },
+            {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            }
+        ]
+        
+        # Initialize cloudscraper for Cloudflare bypass
+        try:
+            self.scraper = cloudscraper.create_scraper()
+            logger.info("Cloudscraper initialized successfully")
+        except Exception as e:
+            logger.warning(f"Could not initialize cloudscraper: {e}")
+            self.scraper = None
     
-    async def fetch_page(self, url):
-        """Fetch a webpage asynchronously"""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+    def get_random_headers(self):
+        """Get random headers to avoid detection"""
+        return random.choice(self.headers_list)
+    
+    async def fetch_page_async(self, url):
+        """Fetch webpage using aiohttp with better headers"""
+        headers = self.get_random_headers()
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
             try:
+                # Add random delay to seem more human
+                await asyncio.sleep(random.uniform(1, 3))
+                
                 async with session.get(url, timeout=30) as response:
                     if response.status == 200:
-                        return await response.text()
+                        html = await response.text()
+                        logger.info(f"Successfully fetched {url}")
+                        return html
+                    elif response.status == 403:
+                        logger.warning(f"403 Forbidden for {url} - trying alternative method")
+                        # Try sync method with cloudscraper
+                        return await self.fetch_page_sync(url)
                     else:
                         logger.error(f"Failed to fetch {url}: Status {response.status}")
                         return None
             except Exception as e:
-                logger.error(f"Error fetching {url}: {e}")
-                return None
+                logger.error(f"Error fetching {url} with aiohttp: {e}")
+                # Fall back to sync method
+                return await self.fetch_page_sync(url)
+    
+    async def fetch_page_sync(self, url):
+        """Fetch webpage using cloudscraper (sync but wrapped in async)"""
+        try:
+            # Run sync cloudscraper in thread pool
+            loop = asyncio.get_event_loop()
+            
+            if self.scraper:
+                html = await loop.run_in_executor(
+                    None, 
+                    lambda: self.scraper.get(url, timeout=10).text
+                )
+                logger.info(f"Successfully fetched {url} with cloudscraper")
+                return html
+            else:
+                # Fallback to requests with good headers
+                import requests
+                headers = self.get_random_headers()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: requests.get(url, headers=headers, timeout=10)
+                )
+                if response.status_code == 200:
+                    return response.text
+                else:
+                    logger.error(f"Requests fallback failed: {response.status_code}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error in sync fetch for {url}: {e}")
+            return None
+    
+    async def fetch_page(self, url):
+        """Main fetch method - tries async first, then sync fallback"""
+        return await self.fetch_page_async(url)
     
     def parse_job_listings(self, html):
-        """Parse job listings from HTML - using html.parser instead of lxml"""
-        soup = BeautifulSoup(html, 'html.parser')  # Changed from 'lxml' to 'html.parser'
+        """Parse job listings from HTML"""
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
         jobs = []
         
-        # Find all job listings - try different selectors
-        # First try: look for listing items
-        listings = []
+        # Try different selectors for expatriates.com
+        # Based on common patterns for classified sites
         
-        # Try multiple possible selectors
-        possible_selectors = [
-            'div.listing',
-            'tr.listing',
-            '.listing-row',
-            '.classified-item',
-            '.ad-item',
-            'div[class*="listing"]',
-            'tr[class*="listing"]'
-        ]
+        # Pattern 1: Look for listing containers
+        listings = soup.find_all(['div', 'tr'], class_=lambda x: x and 'listing' in str(x).lower())
         
-        for selector in possible_selectors:
-            found = soup.select(selector)
-            if found:
-                listings = found
-                logger.info(f"Found {len(listings)} listings with selector: {selector}")
-                break
-        
-        # If no specific selectors found, try to find any job-like containers
+        # Pattern 2: Look for items with links to classifieds
         if not listings:
-            # Look for common patterns
-            all_links = soup.find_all('a')
+            all_links = soup.find_all('a', href=lambda x: x and '/classifieds/' in x)
             for link in all_links:
-                if '/classifieds/' in link.get('href', '') and 'saudi-arabia' in link.get('href', ''):
-                    parent = link.parent
-                    if parent not in listings:
+                if 'saudi-arabia' in link.get('href', ''):
+                    # Get the parent container
+                    parent = link.find_parent(['div', 'tr', 'li'])
+                    if parent and parent not in listings:
                         listings.append(parent)
-            
-            logger.info(f"Found {len(listings)} listings via link search")
         
-        for listing in listings[:50]:  # Limit to 50 listings
+        # Pattern 3: Look for any job-like content
+        if not listings:
+            # Try to find any containers with job-like text
+            for element in soup.find_all(['div', 'td', 'tr']):
+                text = element.get_text().lower()
+                if any(keyword in text for keyword in ['job', 'hire', 'wanted', 'position', 'vacancy']):
+                    listings.append(element)
+        
+        logger.info(f"Found {len(listings)} potential job listings")
+        
+        for listing in listings[:30]:  # Limit to 30 to avoid too many requests
             try:
                 job = {}
                 
-                # Extract title and URL
-                title_elem = listing.find('a')
-                if title_elem:
-                    job['title'] = title_elem.text.strip()
-                    href = title_elem.get('href', '')
-                    if href and not href.startswith('http'):
-                        job['url'] = urljoin(self.base_url, href)
-                    else:
-                        job['url'] = href
-                else:
-                    continue  # Skip if no title
+                # Find title link
+                title_link = listing.find('a')
+                if not title_link:
+                    # Try to find any link in the listing
+                    links = listing.find_all('a')
+                    title_link = links[0] if links else None
                 
-                # Extract description/preview
-                desc_text = listing.get_text()
+                if title_link:
+                    job['title'] = title_link.text.strip()
+                    href = title_link.get('href', '')
+                    if href:
+                        if href.startswith('/'):
+                            job['url'] = urljoin(self.base_url, href)
+                        elif href.startswith('http'):
+                            job['url'] = href
+                        else:
+                            job['url'] = urljoin(self.base_url, '/' + href.lstrip('/'))
+                else:
+                    # Try to extract title from text
+                    text = listing.get_text().strip()
+                    lines = [line.strip() for line in text.split('\n') if line.strip()]
+                    if lines:
+                        job['title'] = lines[0][:100]
+                    else:
+                        job['title'] = "Untitled Job"
+                    job['url'] = self.saudi_url
+                
+                # Extract description
+                full_text = listing.get_text().strip()
                 # Remove title from description
                 if 'title' in job:
-                    desc_text = desc_text.replace(job['title'], '')
-                job['description'] = desc_text.strip()[:500]  # Limit to 500 chars
+                    desc = full_text.replace(job['title'], '').strip()
+                else:
+                    desc = full_text
                 
-                # Try to find date
-                date_patterns = ['Posted', 'Date:', 'Added']
+                # Clean up description
+                desc_lines = [line.strip() for line in desc.split('\n') if line.strip()]
+                job['description'] = ' '.join(desc_lines[:5])[:300]
+                job['full_description'] = desc[:500]
+                
+                # Try to extract date (look for date patterns)
+                date_patterns = [
+                    r'(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})',
+                    r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}',
+                    r'\d+ (day|week|month)s? ago',
+                    r'Posted:? (.+?)(?:\n|$)'
+                ]
+                
                 job['date_posted'] = "Recently"
                 for pattern in date_patterns:
-                    if pattern in desc_text:
-                        # Extract date-like text after pattern
-                        idx = desc_text.find(pattern)
-                        if idx != -1:
-                            date_text = desc_text[idx:idx+50]
-                            job['date_posted'] = date_text.strip()
-                            break
+                    match = re.search(pattern, full_text, re.IGNORECASE)
+                    if match:
+                        job['date_posted'] = match.group(0).strip()
+                        break
                 
                 job['category'] = "General"
                 job['location'] = "Saudi Arabia"
-                job['full_description'] = job['description']
                 
                 jobs.append(job)
                 
             except Exception as e:
-                logger.warning(f"Error parsing listing: {e}")
+                logger.warning(f"Error parsing individual listing: {e}")
                 continue
         
         return jobs
@@ -124,31 +229,60 @@ class ExpatriatesScraper:
         """Extract email and phone numbers from text"""
         contacts = {'email': 'Not found', 'whatsapp': 'Not found'}
         
-        # Extract email
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text, re.IGNORECASE)
+        # Extract email - more robust pattern
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        emails = re.findall(email_pattern, text)
         if emails:
-            contacts['email'] = emails[0]  # Take first email
+            contacts['email'] = emails[0]
         
-        # Extract phone numbers (including WhatsApp)
-        phone_pattern = r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
-        phones = re.findall(phone_pattern, text)
+        # Extract phone numbers - international format support
+        phone_patterns = [
+            r'\+?\d[\d\s\-\(\)]{8,}\d',  # General international
+            r'05\d[\d\s\-]{7,}\d',  # Saudi mobile numbers (05XXXXXXXX)
+            r'01\d[\d\s\-]{7,}\d',  # Saudi landline
+        ]
+        
+        all_phones = []
+        for pattern in phone_patterns:
+            phones = re.findall(pattern, text)
+            all_phones.extend(phones)
         
         # Look for WhatsApp specifically
-        whatsapp_pattern = r'(?:whatsapp|wa\.?)[:\s]*(\+?\d[\d\s\-\(\)]{8,}\d)'
-        whatsapp_match = re.search(whatsapp_pattern, text.lower())
+        whatsapp_keywords = ['whatsapp', 'wa.', 'wa ', 'whats app']
+        for keyword in whatsapp_keywords:
+            if keyword.lower() in text.lower():
+                # Find phone near the keyword
+                keyword_idx = text.lower().find(keyword)
+                if keyword_idx != -1:
+                    # Look for phone in next 50 characters
+                    search_text = text[keyword_idx:keyword_idx + 100]
+                    for pattern in phone_patterns:
+                        match = re.search(pattern, search_text)
+                        if match:
+                            contacts['whatsapp'] = match.group(0).strip()
+                            break
+                break
         
-        if whatsapp_match:
-            contacts['whatsapp'] = whatsapp_match.group(1).strip()
-        elif phones:
-            contacts['whatsapp'] = phones[0].strip()
+        # If no WhatsApp found but phones exist, use first phone
+        if contacts['whatsapp'] == 'Not found' and all_phones:
+            contacts['whatsapp'] = all_phones[0].strip()
         
         return contacts
     
     async def scrape_jobs(self):
-        """Main scraping function"""
-        html = await self.fetch_page(self.saudi_url)
-        if html:
-            jobs = self.parse_job_listings(html)
-            return jobs
-        return []
+        """Main scraping function with error handling"""
+        try:
+            logger.info(f"Starting scrape of {self.saudi_url}")
+            html = await self.fetch_page(self.saudi_url)
+            
+            if html:
+                jobs = self.parse_job_listings(html)
+                logger.info(f"Successfully parsed {len(jobs)} jobs")
+                return jobs
+            else:
+                logger.error("Failed to get HTML content")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error in scrape_jobs: {e}")
+            return []
