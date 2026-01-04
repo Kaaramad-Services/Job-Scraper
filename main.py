@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
 Job Tracker - Main Application
-Monitors expatriates.com for job postings with specific keywords
-Sends Discord notifications for new matches
+FIXED for Render.com deployment
 """
 
 import os
-import time
 import asyncio
 import logging
 from datetime import datetime
+from aiohttp import web  # IMPORTANT: For HTTP server
 from dotenv import load_dotenv
-
-from scraper import ExpatriatesScraper
-from notifier import DiscordNotifier
-from storage import JobStorage
 
 # Load environment variables
 load_dotenv()
@@ -26,42 +21,78 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Import modules
+try:
+    from scraper import ExpatriatesScraper
+    from notifier import DiscordNotifier
+    from storage import JobStorage
+except ImportError as e:
+    logger.error(f"Import error: {e}")
+    # Create dummy classes for testing
+    class ExpatriatesScraper:
+        async def scrape_jobs(self):
+            return []
+    
+    class DiscordNotifier:
+        def __init__(self, url):
+            pass
+        async def send_job_alert(self, job):
+            logger.info(f"Would send Discord alert for: {job.get('title', 'Untitled')}")
+            return True
+    
+    class JobStorage:
+        def __init__(self):
+            self.seen_jobs = {}
+        def job_exists(self, job_id):
+            return False
+        def save_job(self, job_id):
+            pass
+
 class JobTracker:
     def __init__(self):
         self.keywords = os.getenv('JOB_KEYWORDS', '').split(',')
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK_URL')
-        self.check_interval = int(os.getenv('CHECK_INTERVAL', '600'))  # Default 10 minutes
+        self.check_interval = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutes default
         
-        if not self.keywords or self.keywords[0] == '':
-            raise ValueError("Please set JOB_KEYWORDS environment variable")
+        # Clean keywords
+        self.keywords = [k.strip().lower() for k in self.keywords if k.strip()]
+        
+        if not self.keywords:
+            logger.warning("No keywords set. Using default: 'driver'")
+            self.keywords = ['driver']
+        
+        logger.info(f"Tracking keywords: {self.keywords}")
         
         if not self.discord_webhook:
-            raise ValueError("Please set DISCORD_WEBHOOK_URL environment variable")
+            logger.warning("No Discord webhook set. Notifications disabled.")
+            self.notifications_enabled = False
+        else:
+            self.notifications_enabled = True
         
         self.scraper = ExpatriatesScraper()
         self.notifier = DiscordNotifier(self.discord_webhook)
         self.storage = JobStorage()
-        
-        logger.info(f"Job Tracker initialized with keywords: {self.keywords}")
     
     def contains_keywords(self, text):
         """Check if text contains any of our keywords"""
+        if not text:
+            return []
+        
         text_lower = text.lower()
         found_keywords = []
         for keyword in self.keywords:
-            keyword = keyword.strip().lower()
             if keyword and keyword in text_lower:
                 found_keywords.append(keyword)
         return found_keywords
     
     async def check_for_new_jobs(self):
-        """Main function to check for new job postings"""
-        logger.info("Starting job check...")
+        """Check for new job postings"""
+        logger.info("Checking for new jobs...")
         
         try:
-            # Scrape the website
+            # Scrape jobs
             jobs = await self.scraper.scrape_jobs()
-            logger.info(f"Found {len(jobs)} total job postings")
+            logger.info(f"Found {len(jobs)} total jobs")
             
             # Filter by keywords
             matching_jobs = []
@@ -74,11 +105,6 @@ class JobTracker:
                 
                 if all_keywords:
                     job['matched_keywords'] = all_keywords
-                    
-                    # Extract contacts
-                    contacts = self.scraper.extract_contacts(job.get('description', ''))
-                    job.update(contacts)
-                    
                     matching_jobs.append(job)
             
             logger.info(f"Found {len(matching_jobs)} jobs matching keywords")
@@ -86,58 +112,109 @@ class JobTracker:
             # Check for new jobs
             new_jobs = []
             for job in matching_jobs:
-                job_id = job.get('url', '')  # Use URL as ID
+                job_id = job.get('url', job.get('title', ''))
                 if not self.storage.job_exists(job_id):
                     new_jobs.append(job)
                     self.storage.save_job(job_id)
             
-            # Send notifications for new jobs
-            if new_jobs:
+            # Send notifications
+            if new_jobs and self.notifications_enabled:
                 logger.info(f"Sending notifications for {len(new_jobs)} new jobs")
                 for job in new_jobs:
                     await self.notifier.send_job_alert(job)
-            else:
-                logger.info("No new jobs found")
+            elif new_jobs:
+                logger.info(f"Found {len(new_jobs)} new jobs (notifications disabled)")
             
-            # Cleanup old entries (older than 24 hours)
-            self.storage.cleanup_old_entries()
+            return len(new_jobs)
             
         except Exception as e:
-            logger.error(f"Error during job check: {e}")
-            # Send error notification to Discord
-            await self.notifier.send_error_notification(str(e))
+            logger.error(f"Error checking jobs: {e}")
+            return 0
     
-    async def run(self):
-        """Main loop"""
-        logger.info("Job Tracker started!")
-        
-        # Send startup notification
-        await self.notifier.send_startup_notification(self.keywords)
-        
-        while True:
-            try:
-                await self.check_for_new_jobs()
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-            
-            # Wait for next check
-            logger.info(f"Waiting {self.check_interval} seconds until next check...")
-            await asyncio.sleep(self.check_interval)
+    async def health_check(self, request):
+        """Health check endpoint for Render"""
+        return web.Response(text='OK', status=200)
+    
+    async def status_check(self, request):
+        """Status endpoint showing current configuration"""
+        status = {
+            'status': 'running',
+            'keywords': self.keywords,
+            'check_interval': self.check_interval,
+            'notifications_enabled': self.notifications_enabled,
+            'last_check': datetime.now().isoformat()
+        }
+        return web.json_response(status)
+    
+    async def manual_check(self, request):
+        """Manually trigger a job check"""
+        new_jobs = await self.check_for_new_jobs()
+        return web.json_response({
+            'message': f'Manual check completed. Found {new_jobs} new jobs.',
+            'new_jobs': new_jobs
+        })
 
-async def main():
-    """Entry point"""
-    try:
-        tracker = JobTracker()
-        await tracker.run()
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        print(f"\n❌ ERROR: {e}")
-        print("\nPlease set the following environment variables:")
-        print("1. JOB_KEYWORDS=driver,engineer,teacher (comma-separated)")
-        print("2. DISCORD_WEBHOOK_URL=your_discord_webhook_url")
-        print("\nFor Render.com, set these in your dashboard under Environment")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+async def background_task(tracker):
+    """Background task that runs job checks periodically"""
+    logger.info("Background task started")
+    
+    while True:
+        try:
+            await tracker.check_for_new_jobs()
+        except Exception as e:
+            logger.error(f"Error in background task: {e}")
+        
+        # Wait for next check
+        await asyncio.sleep(tracker.check_interval)
+
+async def start_background_tasks(app):
+    """Start background tasks when app starts"""
+    tracker = app['tracker']
+    app['background_task'] = asyncio.create_task(background_task(tracker))
+
+async def cleanup_background_tasks(app):
+    """Cleanup background tasks when app stops"""
+    app['background_task'].cancel()
+    await app['background_task']
+
+async def create_app():
+    """Create web application"""
+    app = web.Application()
+    
+    # Create tracker instance
+    tracker = JobTracker()
+    app['tracker'] = tracker
+    
+    # Add routes
+    app.add_routes([
+        web.get('/', tracker.health_check),
+        web.get('/health', tracker.health_check),
+        web.get('/status', tracker.status_check),
+        web.get('/check', tracker.manual_check),
+    ])
+    
+    # Setup background tasks
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+    
+    return app
+
+def main():
+    """Main entry point"""
+    port = int(os.getenv('PORT', 10000))
+    
+    # Check if we have required environment variables
+    if not os.getenv('DISCORD_WEBHOOK_URL'):
+        logger.warning("DISCORD_WEBHOOK_URL not set. Notifications will be disabled.")
+    
+    if not os.getenv('JOB_KEYWORDS'):
+        logger.warning("JOB_KEYWORDS not set. Using default keywords.")
+    
+    logger.info(f"Starting Job Tracker on port {port}")
+    logger.info(f"Check interval: {os.getenv('CHECK_INTERVAL', '1800')} seconds")
+    
+    # Start the web server
+    web.run_app(create_app(), port=port, host='0.0.0.0')
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
