@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: job-tracker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: CHECK_INTERVAL
+        value: 600
+    disk:
+      name: job-data
+      mountPath: /data
+      sizeGB: 1
